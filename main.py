@@ -5,6 +5,7 @@ import aiohttp
 from telegram import Update, InputMediaPhoto, InputMediaVideo
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from playwright.async_api import async_playwright
+from health_check import start_health_check
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set in Koyeb env
 
