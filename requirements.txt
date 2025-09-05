@@ -1,3 +1,7 @@
 python-telegram-bot==20.3
 aiohttp
 playwright
+pyrogram 
+tgcrypto 
+tqdm
+playwright install
