@@ -1,114 +1,138 @@
-import os
 import logging
-import asyncio
-import aiohttp
-from telegram import Update, InputMediaPhoto, InputMediaVideo
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
 from health_check import start_health_check
+import asyncio
+import os
+import subprocess
+from pyrogram import Client, filters
+from playwright.async_api import async_playwright
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set in Koyeb env
+# ================== CONFIG ==================
+API_ID = 27083483
+API_HASH = "1ba790464745c13ce149649d73137e52"
+BOT_TOKEN = "7472633060:AAFChNfkMNsoqeExm0xKK2T5CpaGQpI9Sn0"
+CHANNEL_ID = -1002800389370
+# ============================================
 
-logging.basicConfig(level=logging.INFO)
+bot = Client("twitter_leech", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-async def download_file(url, filename):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            content = await resp.read()
-            with open(filename, "wb") as f:
-                f.write(content)
 
-async def scrape_twitter(username: str, max_tweets=5):
-    results = []
+async def install_chromium():
+    """Install Chromium if not found."""
+    try:
+        from playwright.__main__ import main as pw_main
+        print("Installing Chromium for Playwright...")
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        print("Chromium installed successfully.")
+    except Exception as e:
+        print("Error installing Chromium:", e)
 
+
+async def fetch_twitter_media(username: str, limit=5):
+    """Scrape Twitter page using Playwright and get media URLs."""
+    media_list = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-        await page.goto(f"https://twitter.com/{username}", timeout=60000)
-        await page.wait_for_selector("article", timeout=15000)
+        url = f"https://twitter.com/{username}"
+        await page.goto(url)
+        await page.wait_for_timeout(5000)  # wait 5 seconds for tweets to load
 
-        tweet_articles = await page.query_selector_all("article")
+        tweets = await page.query_selector_all("article")
         count = 0
-
-        for article in tweet_articles:
-            if count >= max_tweets:
+        for tweet in tweets:
+            if count >= limit:
                 break
-
-            text = await article.inner_text()
+            imgs = await tweet.query_selector_all("img[src*='twimg']")
+            videos = await tweet.query_selector_all("video")
             media_urls = []
-
-            images = await article.query_selector_all("img")
-            for img in images:
+            for img in imgs:
                 src = await img.get_attribute("src")
-                if src and "profile_images" not in src:
+                if src:
                     media_urls.append(src)
-
-            videos = await article.query_selector_all("video")
             for vid in videos:
                 src = await vid.get_attribute("src")
                 if src:
                     media_urls.append(src)
-
             if media_urls:
-                results.append({
-                    "text": text,
-                    "media": media_urls[:3]  # Limit media per tweet
-                })
+                media_list.append({"urls": media_urls})
                 count += 1
 
         await browser.close()
+    return media_list
 
-    return results
 
-async def scrape_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /scrape <username>")
-        return
+@bot.on_message(filters.command("start"))
+async def start(client, message):
+    await message.reply_text(
+        "🤖 Twitter Leech Bot Ready!\n"
+        "Use `/leech username [limit]` to fetch media."
+    )
 
-    username = context.args[0].lstrip('@')
-    await update.message.reply_text(f"🔍 Scraping @{username}, please wait...")
 
+@bot.on_message(filters.command("leech"))
+async def leech(client, message):
     try:
-        tweets = await scrape_twitter(username)
+        parts = message.text.split()
+        if len(parts) < 2:
+            return await message.reply_text("Usage: `/leech username [limit]`")
+        username = parts[1].replace("@", "")
+        limit = int(parts[2]) if len(parts) > 2 else 5
+        status = await message.reply_text(f"📡 Fetching {limit} tweets from @{username}...")
 
-        if not tweets:
-            await update.message.reply_text("No media tweets found.")
-            return
+        media_list = await fetch_twitter_media(username, limit)
 
-        for idx, tweet in enumerate(tweets, start=1):
-            caption = tweet["text"][:1024]  # Telegram caption limit
-            media_files = []
+        if not media_list:
+            return await status.edit_text("❌ No media found.")
 
-            for i, url in enumerate(tweet["media"]):
-                ext = ".jpg" if ".jpg" in url else ".mp4"
-                fname = f"media_{idx}_{i}{ext}"
-                await download_file(url, fname)
-                media_files.append(fname)
+        total = len(media_list)
+        for i, tweet in enumerate(media_list, start=1):
+            await status.edit_text(f"⬇️ Downloading tweet {i}/{total}...")
+            for url in tweet["urls"]:
+                try:
+                    if url.endswith(".mp4"):
+                        await bot.send_video(CHANNEL_ID, url)
+                    else:
+                        await bot.send_photo(CHANNEL_ID, url)
+                except Exception as e:
+                    print("Send error:", e)
 
-            media_group = []
-            for file in media_files:
-                if file.endswith(".mp4"):
-                    media_group.append(InputMediaVideo(open(file, "rb")))
-                else:
-                    media_group.append(InputMediaPhoto(open(file, "rb")))
-
-            if media_group:
-                await update.message.reply_media_group(media_group)
-                await update.message.reply_text(caption)
-
-            # Cleanup
-            for file in media_files:
-                os.remove(file)
-
+        await status.edit_text("✅ Done!")
     except Exception as e:
-        logging.error(str(e))
-        await update.message.reply_text("❌ Error occurred during scraping.")
+        await message.reply_text(f"❌ Error: {str(e)}")
 
-def main():
-    token = BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE"
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("scrape", scrape_handler))
-    app.run_polling()
 
-if __name__ == "__main__":
-    main()
+@bot.on_message(filters.regex(r"https?://(www\.)?twitter\.com/\S+"))
+async def direct_link(client, message):
+    try:
+        url = message.matches[0].group(0)
+        status = await message.reply_text("⬇️ Fetching media...")
+        username = url.split("/")[3]  # extract username from link
+        media_list = await fetch_twitter_media(username, limit=5)
+
+        if not media_list:
+            return await status.edit_text("❌ No media found.")
+
+        total = len(media_list)
+        for i, tweet in enumerate(media_list, start=1):
+            await status.edit_text(f"⬇️ Downloading tweet {i}/{total}...")
+            for url in tweet["urls"]:
+                try:
+                    if url.endswith(".mp4"):
+                        await bot.send_video(CHANNEL_ID, url)
+                    else:
+                        await bot.send_photo(CHANNEL_ID, url)
+                except Exception as e:
+                    print("Send error:", e)
+
+        await status.edit_text("✅ Media sent!")
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {str(e)}")
+
+
+# ----------------- RUN BOT -----------------
+async def main():
+    await install_chromium()  # self-install Chromium
+    bot.run()
+
+
+asyncio.run(main())
