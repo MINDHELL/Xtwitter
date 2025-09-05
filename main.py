@@ -1,114 +1,125 @@
-import os
 import logging
-import asyncio
-import aiohttp
-from telegram import Update, InputMediaPhoto, InputMediaVideo
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-from playwright.async_api import async_playwright
 from health_check import start_health_check
+import os
+import asyncio
+import re
+import requests
+from tqdm import tqdm
+from pyrogram import Client, filters
+from playwright.async_api import async_playwright
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")  # Set in Koyeb env
+# ========================
+# CONFIG
+# ========================
+API_ID = 27083483
+API_HASH = "1ba790464745c13ce149649d73137e52"
+BOT_TOKEN = "7472633060:AAFChNfkMNsoqeExm0xKK2T5CpaGQpI9Sn0"
+CHANNEL_ID = -1002800389370
 
-logging.basicConfig(level=logging.INFO)
+bot = Client("twitter_leech_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+
+# ========================
+# HELPERS
+# ========================
 async def download_file(url, filename):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            content = await resp.read()
-            with open(filename, "wb") as f:
-                f.write(content)
+    """Download file with progress bar"""
+    r = requests.get(url, stream=True)
+    total_size = int(r.headers.get("content-length", 0))
+    block_size = 1024
+    with open(filename, "wb") as f, tqdm(
+        total=total_size, unit="B", unit_scale=True, desc=filename
+    ) as pbar:
+        for data in r.iter_content(block_size):
+            f.write(data)
+            pbar.update(len(data))
+    return filename
 
-async def scrape_twitter(username: str, max_tweets=5):
-    results = []
 
+async def scrape_tweets(username, limit=10):
+    """Scrape tweets with Playwright"""
+    media_items = []
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await p.firefox.launch(headless=True)
         page = await browser.new_page()
-        await page.goto(f"https://twitter.com/{username}", timeout=60000)
-        await page.wait_for_selector("article", timeout=15000)
+        url = f"https://x.com/{username}"
+        await page.goto(url)
 
-        tweet_articles = await page.query_selector_all("article")
-        count = 0
+        # Scroll to load tweets
+        for _ in range(5):  # adjust scroll depth
+            await page.mouse.wheel(0, 2000)
+            await asyncio.sleep(2)
 
-        for article in tweet_articles:
-            if count >= max_tweets:
-                break
+        # Extract tweet blocks
+        tweets = await page.query_selector_all("article")
+        for tweet in tweets[:limit]:
+            caption = await tweet.inner_text()
 
-            text = await article.inner_text()
-            media_urls = []
-
-            images = await article.query_selector_all("img")
+            # Images
+            images = await tweet.query_selector_all("img")
             for img in images:
                 src = await img.get_attribute("src")
-                if src and "profile_images" not in src:
-                    media_urls.append(src)
+                if src and "profile_images" not in src:  # filter avatars
+                    media_items.append(("photo", src, caption))
 
-            videos = await article.query_selector_all("video")
+            # Videos (Twitter uses .mp4 in source tags)
+            videos = await tweet.query_selector_all("video source")
             for vid in videos:
                 src = await vid.get_attribute("src")
-                if src:
-                    media_urls.append(src)
-
-            if media_urls:
-                results.append({
-                    "text": text,
-                    "media": media_urls[:3]  # Limit media per tweet
-                })
-                count += 1
+                if src and src.endswith(".mp4"):
+                    media_items.append(("video", src, caption))
 
         await browser.close()
 
-    return results
+    return media_items
 
-async def scrape_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /scrape <username>")
+
+async def send_media_to_channel(client, items):
+    """Send media to Telegram channel"""
+    for idx, (mtype, url, caption) in enumerate(items, start=1):
+        filename = f"{mtype}_{idx}.{'jpg' if mtype=='photo' else 'mp4'}"
+        await download_file(url, filename)
+
+        if mtype == "photo":
+            await client.send_photo(CHANNEL_ID, photo=filename, caption=caption)
+        else:
+            await client.send_video(CHANNEL_ID, video=filename, caption=caption)
+
+        os.remove(filename)
+
+
+# ========================
+# BOT COMMANDS
+# ========================
+@bot.on_message(filters.command("start"))
+async def start(client, message):
+    await message.reply_text("🤖 Playwright Twitter Leech Bot Started!\n\nUse /leech <username>")
+
+
+@bot.on_message(filters.command("leech"))
+async def leech(client, message):
+    if len(message.command) < 2:
+        await message.reply_text("⚠️ Usage: `/leech username`", quote=True)
         return
 
-    username = context.args[0].lstrip('@')
-    await update.message.reply_text(f"🔍 Scraping @{username}, please wait...")
+    username = message.command[1]
+    await message.reply_text(f"🔎 Scraping tweets from @{username}...")
 
     try:
-        tweets = await scrape_twitter(username)
-
-        if not tweets:
-            await update.message.reply_text("No media tweets found.")
+        items = await scrape_tweets(username, limit=20)  # adjust limit
+        if not items:
+            await message.reply_text("⚠️ No media found.")
             return
 
-        for idx, tweet in enumerate(tweets, start=1):
-            caption = tweet["text"][:1024]  # Telegram caption limit
-            media_files = []
-
-            for i, url in enumerate(tweet["media"]):
-                ext = ".jpg" if ".jpg" in url else ".mp4"
-                fname = f"media_{idx}_{i}{ext}"
-                await download_file(url, fname)
-                media_files.append(fname)
-
-            media_group = []
-            for file in media_files:
-                if file.endswith(".mp4"):
-                    media_group.append(InputMediaVideo(open(file, "rb")))
-                else:
-                    media_group.append(InputMediaPhoto(open(file, "rb")))
-
-            if media_group:
-                await update.message.reply_media_group(media_group)
-                await update.message.reply_text(caption)
-
-            # Cleanup
-            for file in media_files:
-                os.remove(file)
+        await send_media_to_channel(client, items)
+        await message.reply_text("✅ Done! All media sent to channel.")
 
     except Exception as e:
-        logging.error(str(e))
-        await update.message.reply_text("❌ Error occurred during scraping.")
+        await message.reply_text(f"❌ Error: {e}")
 
-def main():
-    token = BOT_TOKEN or "PASTE_YOUR_BOT_TOKEN_HERE"
-    app = ApplicationBuilder().token(token).build()
-    app.add_handler(CommandHandler("scrape", scrape_handler))
-    app.run_polling()
 
-if __name__ == "__main__":
-    main()
+# ========================
+# RUN
+# ========================
+print("🤖 Playwright Twitter Leech Bot Started!")
+bot.run()
