@@ -3,7 +3,6 @@ from health_check import start_health_check
 import asyncio
 from pyrogram import Client, filters
 from playwright.async_api import async_playwright
-import os
 
 # =====================
 # 🔧 Bot Config
@@ -11,7 +10,7 @@ import os
 API_ID = 27083483
 API_HASH = "1ba790464745c13ce149649d73137e52"
 BOT_TOKEN = "7472633060:AAFChNfkMNsoqeExm0xKK2T5CpaGQpI9Sn0"
-CHANNEL_ID = -1002800389370  # your channel id
+CHANNEL_ID = -1002800389370
 
 bot = Client("twitter_leech", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -19,38 +18,48 @@ bot = Client("twitter_leech", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TO
 # =====================
 # 🎭 Playwright Scraper
 # =====================
-async def scrape_twitter(username: str, limit: int = 5):
-    """Scrapes Twitter profile for media using Chromium."""
+async def scrape_twitter(username: str, limit: int = 20):
+    """Scrape media from a Twitter profile using scrolling."""
     results = []
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)  # force Chromium
+        browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
         await page.goto(f"https://twitter.com/{username}", timeout=60000)
 
-        # Wait for tweets to load
         await page.wait_for_selector("article", timeout=60000)
+        last_height = 0
 
-        tweets = await page.query_selector_all("article")
-        count = 0
+        while len(results) < limit:
+            tweets = await page.query_selector_all("article")
 
-        for tweet in tweets:
-            if count >= limit:
+            for tweet in tweets:
+                if len(results) >= limit:
+                    break
+                try:
+                    caption = await tweet.inner_text()
+                    media = await tweet.query_selector_all("img, video")
+
+                    for m in media:
+                        src = await m.get_attribute("src")
+                        if src and ("twimg" in src or "video" in src):
+                            # Avoid duplicates
+                            if not any(r["url"] == src for r in results):
+                                results.append({"caption": caption, "url": src})
+                                if len(results) >= limit:
+                                    break
+                except Exception as e:
+                    print("Parse error:", e)
+
+            # Scroll down
+            await page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
+            await asyncio.sleep(2)
+
+            # Detect if page stopped loading
+            new_height = await page.evaluate("document.body.scrollHeight")
+            if new_height == last_height:
                 break
-
-            try:
-                content = await tweet.inner_text()
-                media = await tweet.query_selector_all("img, video")
-
-                for m in media:
-                    src = await m.get_attribute("src")
-                    if src and ("twimg" in src or "video" in src):
-                        results.append({"caption": content, "url": src})
-                        count += 1
-                        if count >= limit:
-                            break
-            except Exception as e:
-                print("Error parsing tweet:", e)
+            last_height = new_height
 
         await browser.close()
     return results
@@ -61,7 +70,7 @@ async def scrape_twitter(username: str, limit: int = 5):
 # =====================
 @bot.on_message(filters.command("start"))
 async def start_cmd(client, message):
-    await message.reply_text("🤖 Twitter Leech Bot Started!\nSend `/leech username` to begin.")
+    await message.reply_text("🤖 Twitter Leech Bot Ready!\nUse `/leech username [limit]`")
 
 
 @bot.on_message(filters.command("leech"))
@@ -69,21 +78,22 @@ async def leech_cmd(client, message):
     try:
         parts = message.text.split()
         if len(parts) < 2:
-            await message.reply_text("❌ Usage: `/leech username`")
+            await message.reply_text("❌ Usage: `/leech username [limit]`")
             return
 
         username = parts[1]
-        msg = await message.reply_text(f"🔎 Fetching posts from **{username}** ...")
+        limit = int(parts[2]) if len(parts) > 2 else 10
 
-        posts = await scrape_twitter(username, limit=10)
+        msg = await message.reply_text(f"🔎 Fetching up to {limit} posts from **{username}** ...")
 
+        posts = await scrape_twitter(username, limit=limit)
         if not posts:
             await msg.edit("⚠️ No media found!")
             return
 
+        total = len(posts)
         for idx, post in enumerate(posts, start=1):
-            progress = f"📤 Uploading {idx}/{len(posts)}"
-            await msg.edit(progress)
+            await msg.edit(f"📤 Uploading {idx}/{total} from @{username}")
 
             try:
                 if post["url"].endswith(".mp4"):
@@ -101,7 +111,7 @@ async def leech_cmd(client, message):
             except Exception as e:
                 print("Upload error:", e)
 
-        await msg.edit("✅ All posts uploaded!")
+        await msg.edit(f"✅ Done! {total} posts uploaded from @{username}")
 
     except Exception as e:
         await message.reply_text(f"❌ Error: {e}")
