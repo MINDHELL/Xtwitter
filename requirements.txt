@@ -4,4 +4,3 @@ playwright
 pyrogram 
 tgcrypto 
 tqdm
-playwright install
