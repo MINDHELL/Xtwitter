@@ -1,2 +1,1 @@
-release: playwright install chromium
-worker: python main.py
+worker: playwright install chromium && python main.py
