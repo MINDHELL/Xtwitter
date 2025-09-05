@@ -5,3 +5,4 @@ pyrogram
 tgcrypto 
 tqdm
 requests
+playwright install chromium
