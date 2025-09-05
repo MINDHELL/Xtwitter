@@ -4,3 +4,4 @@ playwright
 pyrogram 
 tgcrypto 
 tqdm
+requests
